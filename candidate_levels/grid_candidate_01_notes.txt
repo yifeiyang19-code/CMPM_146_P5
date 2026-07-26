@@ -1,0 +1,10 @@
+Encoding: Individual_Grid
+Population used: 40
+Result: structurally valid and not overcrowded
+Status: candidate, requires gameplay testing
+Notes:
+- 3 pipes
+- 9 enemies
+- 12 coins
+- floor gaps are 1-2 tiles wide
+- approximately 91% empty space

@@ -6,8 +6,13 @@ import os
 import random
 import time
 
-import metrics
+# Prevent NumPy/OpenBLAS from creating many threads in every worker process.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+import metrics
 width = 200
 height = 16
 
@@ -98,20 +103,41 @@ def repair_grid(genome):
 
 
 def common_fitness(level):
-    """A simple fitness function shared by both encodings."""
+    """A simple fitness function shared by both encodings.
+
+    Solvability is most important. The remaining terms reward a small number
+    of useful jumps and decorations, while penalizing levels that become too
+    crowded. This prevents long runs from filling the lower half of the map
+    with random tiles.
+    """
     measurements = metrics.metrics(level)
 
-    # Solvability is the most important goal. The other terms encourage
-    # reachable space, jumps, decoration, and less perfectly linear terrain.
     score = 0.0
-    score += 6.0 * measurements["solvability"]
+    score += 8.0 * measurements["solvability"]
     score += 1.0 * measurements["negativeSpace"]
     score += 0.5 * measurements["pathPercentage"]
-    score += 0.8 * measurements["meaningfulJumps"]
-    score += 0.2 * measurements["jumps"]
-    score += 4.0 * measurements["decorationPercentage"]
-    score -= 0.5 * measurements["linearity"]
 
+    # Reward jumps only up to a reasonable amount. Without a cap, the GA can
+    # increase fitness by filling the level with obstacles that force jumps.
+    jumps = max(0.0, measurements["jumps"])
+    meaningful_jumps = max(0.0, measurements["meaningfulJumps"])
+    score += 0.6 * min(meaningful_jumps, 8.0)
+    score += 0.1 * min(jumps, 12.0)
+    if jumps > 15.0:
+        score -= 0.25 * (jumps - 15.0)
+
+    # A little decoration is useful, but too much creates noisy levels.
+    decoration = measurements["decorationPercentage"]
+    score += 4.0 * min(decoration, 0.06)
+    if decoration > 0.08:
+        score -= 30.0 * (decoration - 0.08)
+
+    # Normal Mario levels should remain mostly empty space.
+    empty_percentage = measurements["emptyPercentage"]
+    if empty_percentage < 0.82:
+        score -= 20.0 * (0.82 - empty_percentage)
+
+    score -= 0.5 * measurements["linearity"]
     return score
 
 
@@ -134,13 +160,13 @@ class Individual_Grid(object):
         return self._fitness
 
     def mutate(self, genome):
-        """Mutate one child with a 20 percent individual mutation rate.
+        """Mutate one child with a 10 percent individual mutation rate.
 
         Most mutations change one normal tile. A smaller number create or
         remove a short hole, or add a complete pipe. This keeps the operator
         simple while avoiding isolated pipe pieces.
         """
-        if random.random() >= 0.20:
+        if random.random() >= 0.10:
             return repair_grid(genome)
 
         choice = random.random()
@@ -150,11 +176,16 @@ class Individual_Grid(object):
             # because a pipe should be created as one complete structure.
             x = random.randint(5, width - 6)
             y = random.randint(6, height - 2)
-            genome[y][x] = random.choices(
-                ["-", "X", "B", "?", "M", "o", "E"],
-                weights=[45, 15, 10, 8, 2, 15, 5],
-                k=1,
-            )[0]
+            if genome[y][x] == "-":
+                genome[y][x] = random.choices(
+                    ["X", "B", "?", "M", "o", "E"],
+                    weights=[25, 20, 15, 3, 30, 7],
+                    k=1,
+                )[0]
+            elif random.random() < 0.65:
+                genome[y][x] = "-"
+            else:
+                genome[y][x] = random.choice(["X", "B", "?", "o"])
 
         elif choice < 0.85:
             # Toggle a short hole in the ground.
@@ -165,16 +196,18 @@ class Individual_Grid(object):
                 genome[15][x + dx] = "-" if make_hole else "X"
 
         else:
-            # Add one complete pipe with height 2-4.
+            # Add or remove one complete pipe.
             x = random.randint(5, width - 6)
-            pipe_height = random.randint(2, 4)
+            has_pipe = any(genome[y][x] in {"T", "|"} for y in range(height))
             for y in range(height):
                 if genome[y][x] in {"T", "|"}:
                     genome[y][x] = "-"
-            top_y = height - pipe_height - 1
-            genome[top_y][x] = "T"
-            for y in range(top_y + 1, height):
-                genome[y][x] = "|"
+            if not has_pipe:
+                pipe_height = random.randint(2, 4)
+                top_y = height - pipe_height - 1
+                genome[top_y][x] = "T"
+                for y in range(top_y + 1, height):
+                    genome[y][x] = "|"
 
         return repair_grid(genome)
 
@@ -540,7 +573,7 @@ def ga():
     pop_limit = 480
     os.makedirs("levels", exist_ok=True)
 
-    process_count = os.cpu_count() or 1
+    process_count = min(4, os.cpu_count() or 1, pop_limit)
     batch_size = int(math.ceil(pop_limit / process_count))
 
     with mpool.Pool(processes=process_count) as pool:
