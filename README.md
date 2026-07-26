@@ -13,5 +13,3 @@ Current Test
 Both Grid and DE were tested locally with a population of 40.
 
 The saved Grid and DE candidates are 16 x 200 levels and were reported as solvable by the provided metrics.
-
-The final writeup will compare the two favorite levels and explain why one was selected for submission.
