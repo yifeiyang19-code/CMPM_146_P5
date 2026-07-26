@@ -1,3 +1,14 @@
+"""Genetic algorithm for evolving Super Mario Bros. levels.
+
+The module supports two genome representations:
+
+* ``Individual_Grid`` stores the complete tile map.
+* ``Individual_DE`` stores a variable-length list of design elements.
+
+Both representations use the supplied course metrics, elitist preservation,
+tournament selection, crossover, and mutation.
+"""
+
 import copy
 import heapq
 import math
@@ -6,16 +17,23 @@ import os
 import random
 import time
 
-# Prevent NumPy/OpenBLAS from creating many threads in every worker process.
+# Restrict numerical libraries to one thread per worker. This prevents
+# nested parallelism from exhausting system memory during multiprocessing.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import metrics
+
+# ---------------------------------------------------------------------------
+# Level Constants
+# ---------------------------------------------------------------------------
+
 width = 200
 height = 16
 
+# Tile symbols defined by the supplied Mario level format.
 options = [
     "-",  # empty space
     "X",  # solid wall
@@ -28,8 +46,13 @@ options = [
     "E",  # enemy
 ]
 
+# Tiles treated as solid support by structural validation.
 SOLID_TILES = {"X", "?", "M", "B", "|", "T", "v", "f", "m"}
 
+
+# ---------------------------------------------------------------------------
+# Shared Utility Functions
+# ---------------------------------------------------------------------------
 
 def clip(lo, value, hi):
     if value < lo:
@@ -40,6 +63,8 @@ def clip(lo, value, hi):
 
 
 def offset_by_upto(value, variance, min=None, max=None):
+    # Apply a normally distributed offset and constrain the result to the
+    # specified bounds.
     value += random.normalvariate(0, variance ** 0.5)
     if min is not None and value < min:
         value = min
@@ -49,7 +74,9 @@ def offset_by_upto(value, variance, min=None, max=None):
 
 
 def repair_boundaries(genome):
-    """Restore Mario's start and the goal after crossover or mutation."""
+    """Restore the required start and goal tiles after genetic operations."""
+
+    # The first and last columns are reserved by the level specification.
     for y in range(height):
         genome[y][0] = "-"
         genome[y][-1] = "-"
@@ -66,20 +93,20 @@ def repair_boundaries(genome):
 
 
 def repair_grid(genome):
-    """Apply a few simple safety rules to a Grid genome.
+    """Enforce basic structural constraints on a Grid genome.
 
-    This is intentionally small and easy to explain. It only protects the
-    start/end, limits very long holes, and removes enemies with no support.
+    The repair step preserves the required boundaries, limits ground gaps,
+    and removes unsupported enemies.
     """
     repair_boundaries(genome)
 
-    # Give Mario and the flag a short safe area.
+    # Preserve short ground sections near the start and goal.
     for x in range(1, 5):
         genome[15][x] = "X"
     for x in range(width - 5, width - 1):
         genome[15][x] = "X"
 
-    # A hole wider than four tiles is usually unreasonable for the player.
+    # Limit each continuous ground gap to four tiles.
     x = 1
     while x < width - 1:
         if genome[15][x] != "-":
@@ -93,7 +120,7 @@ def repair_grid(genome):
         for fill_x in range(start + 4, x):
             genome[15][fill_x] = "X"
 
-    # Enemies must stand on a solid tile.
+    # Remove enemies that are not supported by a solid tile.
     for y in range(height - 1):
         for x in range(1, width - 1):
             if genome[y][x] == "E" and genome[y + 1][x] not in SOLID_TILES:
@@ -102,13 +129,16 @@ def repair_grid(genome):
     return repair_boundaries(genome)
 
 
-def common_fitness(level):
-    """A simple fitness function shared by both encodings.
+# ---------------------------------------------------------------------------
+# Shared Fitness Function
+# ---------------------------------------------------------------------------
 
-    Solvability is most important. The remaining terms reward a small number
-    of useful jumps and decorations, while penalizing levels that become too
-    crowded. This prevents long runs from filling the lower half of the map
-    with random tiles.
+def common_fitness(level):
+    """Compute the fitness score used by both genome representations.
+
+    Solvability receives the highest weight. Secondary terms reward useful
+    jumps, navigable space, and moderate decoration while penalizing excessive
+    obstacle density.
     """
     measurements = metrics.metrics(level)
 
@@ -117,8 +147,8 @@ def common_fitness(level):
     score += 1.0 * measurements["negativeSpace"]
     score += 0.5 * measurements["pathPercentage"]
 
-    # Reward jumps only up to a reasonable amount. Without a cap, the GA can
-    # increase fitness by filling the level with obstacles that force jumps.
+    # Cap jump rewards to prevent excessive obstacle placement from
+    # increasing fitness without improving level quality.
     jumps = max(0.0, measurements["jumps"])
     meaningful_jumps = max(0.0, measurements["meaningfulJumps"])
     score += 0.6 * min(meaningful_jumps, 8.0)
@@ -126,13 +156,13 @@ def common_fitness(level):
     if jumps > 15.0:
         score -= 0.25 * (jumps - 15.0)
 
-    # A little decoration is useful, but too much creates noisy levels.
+    # Reward moderate decoration and penalize excessive visual density.
     decoration = measurements["decorationPercentage"]
     score += 4.0 * min(decoration, 0.06)
     if decoration > 0.08:
         score -= 30.0 * (decoration - 0.08)
 
-    # Normal Mario levels should remain mostly empty space.
+    # Penalize levels whose usable space becomes excessively occupied.
     empty_percentage = measurements["emptyPercentage"]
     if empty_percentage < 0.82:
         score -= 20.0 * (0.82 - empty_percentage)
@@ -141,9 +171,14 @@ def common_fitness(level):
     return score
 
 
-class Individual_Grid(object):
-    """A Mario level represented directly as a grid of tiles."""
+# ---------------------------------------------------------------------------
+# Grid Representation
+# ---------------------------------------------------------------------------
 
+class Individual_Grid(object):
+    """Represent a Mario level as a complete two-dimensional tile grid."""
+
+    # Restrict instance attributes to reduce per-individual memory usage.
     __slots__ = ["genome", "_fitness"]
 
     def __init__(self, genome):
@@ -151,6 +186,8 @@ class Individual_Grid(object):
         self._fitness = None
 
     def calculate_fitness(self):
+        # Cache the score because selection may evaluate the same individual
+        # multiple times within a generation.
         self._fitness = common_fitness(self.to_level())
         return self
 
@@ -160,11 +197,10 @@ class Individual_Grid(object):
         return self._fitness
 
     def mutate(self, genome):
-        """Mutate one child with a 10 percent individual mutation rate.
+        """Apply one Grid mutation with a 10 percent mutation probability.
 
-        Most mutations change one normal tile. A smaller number create or
-        remove a short hole, or add a complete pipe. This keeps the operator
-        simple while avoiding isolated pipe pieces.
+        The operator modifies a single tile, toggles a short ground gap, or
+        adds or removes a complete pipe structure.
         """
         if random.random() >= 0.10:
             return repair_grid(genome)
@@ -172,8 +208,8 @@ class Individual_Grid(object):
         choice = random.random()
 
         if choice < 0.70:
-            # Change one non-boundary tile. Pipe characters are not chosen here
-            # because a pipe should be created as one complete structure.
+            # Modify one non-boundary tile. Pipe tiles are excluded because
+            # pipes are generated as complete structures.
             x = random.randint(5, width - 6)
             y = random.randint(6, height - 2)
             if genome[y][x] == "-":
@@ -188,7 +224,7 @@ class Individual_Grid(object):
                 genome[y][x] = random.choice(["X", "B", "?", "o"])
 
         elif choice < 0.85:
-            # Toggle a short hole in the ground.
+            # Toggle a ground gap with a width of one to three tiles.
             x = random.randint(5, width - 9)
             hole_width = random.randint(1, 3)
             make_hole = all(genome[15][x + dx] != "-" for dx in range(hole_width))
@@ -196,7 +232,7 @@ class Individual_Grid(object):
                 genome[15][x + dx] = "-" if make_hole else "X"
 
         else:
-            # Add or remove one complete pipe.
+            # Add or remove one complete vertical pipe.
             x = random.randint(5, width - 6)
             has_pipe = any(genome[y][x] in {"T", "|"} for y in range(height))
             for y in range(height):
@@ -212,7 +248,10 @@ class Individual_Grid(object):
         return repair_grid(genome)
 
     def generate_children(self, other):
-        """Create two children with column-based single-point crossover."""
+        """Create two children using column-based single-point crossover."""
+
+        # A vertical crossover point preserves contiguous horizontal sections
+        # from each parent.
         cut = random.randint(5, width - 6)
 
         child_a = copy.deepcopy(self.genome)
@@ -232,6 +271,7 @@ class Individual_Grid(object):
 
     @classmethod
     def empty_individual(cls):
+        # Initialize an empty level with a continuous ground row.
         genome = [["-" for _x in range(width)] for _y in range(height)]
         genome[15][:] = ["X"] * width
         repair_boundaries(genome)
@@ -239,9 +279,11 @@ class Individual_Grid(object):
 
     @classmethod
     def random_individual(cls):
-        """Create a simple random level from a flat starting level."""
+        """Create a random Grid individual from a valid flat level."""
         genome = cls.empty_individual().genome
 
+        # Traverse the level from left to right and place structures at
+        # probabilistically selected positions.
         x = 5
         while x < width - 6:
             roll = random.random()
@@ -284,6 +326,13 @@ class Individual_Grid(object):
         return cls(repair_grid(genome))
 
 
+# ---------------------------------------------------------------------------
+# Design Element Representation
+#
+# Each genome entry has the form (x, element_type, ...parameters).
+# Example: (40, "0_hole", 3) represents a three-tile gap beginning at x = 40.
+# ---------------------------------------------------------------------------
+
 def random_design_element():
     """Create one valid design element for the DE encoding."""
     x = random.randint(5, width - 6)
@@ -319,11 +368,15 @@ class Individual_DE(object):
 
     def __init__(self, genome):
         self.genome = list(genome)
+
+        # Preserve the heap-based genome organization used by the starter
+        # implementation.
         heapq.heapify(self.genome)
         self._fitness = None
         self._level = None
 
     def calculate_fitness(self):
+        # Evaluate the rendered level using the shared metric-based score.
         score = common_fitness(self.to_level())
 
         # Simple DE-specific limits. They discourage extreme genomes without
@@ -437,6 +490,8 @@ class Individual_DE(object):
             heapq.heapify(new_genome)
             return new_genome
 
+        # Change operations modify existing elements; insertion and deletion
+        # support variable-length genome evolution.
         operation = random.choices(
             ["change", "add", "delete"],
             weights=[60, 25, 15],
@@ -455,7 +510,10 @@ class Individual_DE(object):
         return new_genome
 
     def generate_children(self, other):
-        """Use the template's variable-point crossover, safely handling empties."""
+        """Create two children using independent crossover points."""
+
+        # Independent crossover points support parents with different genome
+        # lengths, including empty genomes.
         point_a = random.randint(0, len(self.genome))
         point_b = random.randint(0, len(other.genome))
 
@@ -468,9 +526,13 @@ class Individual_DE(object):
         )
 
     def to_level(self):
+        # Cache the rendered level because the genome remains immutable after
+        # individual construction.
         if self._level is None:
             base = Individual_Grid.empty_individual().to_level()
 
+            # Render elements in a deterministic order. Later elements may
+            # overwrite tiles produced by earlier overlapping elements.
             for de in sorted(self.genome, key=lambda element: (element[1], element[0], element)):
                 x = de[0]
                 de_type = de[1]
@@ -531,26 +593,35 @@ class Individual_DE(object):
         return cls([random_design_element() for _ in range(element_count)])
 
 
-# Change this line to Individual_DE when testing the second representation.
+# ---------------------------------------------------------------------------
+# Active Genome Representation
+# ---------------------------------------------------------------------------
+
+# Select the representation used for the current experiment.
+# Replace Individual_Grid with Individual_DE to run the DE encoding.
 Individual = Individual_Grid
 
 
+# ---------------------------------------------------------------------------
+# Selection and Successor Generation
+# ---------------------------------------------------------------------------
+
 def tournament_select(population, tournament_size=4):
-    """Return the best individual from a small random sample."""
+    """Select the highest-fitness individual from a random tournament."""
     competitors = random.sample(population, min(tournament_size, len(population)))
     return max(competitors, key=Individual.fitness)
 
 
 def generate_successors(population):
-    """Create the next population using elitism and tournament selection."""
+    """Generate the next population using elitism and tournament selection."""
     population_size = len(population)
     sorted_population = sorted(population, key=Individual.fitness, reverse=True)
 
-    # Selection strategy 1: keep the best 10 percent unchanged.
+    # Elitism: preserve the highest-fitness 10 percent unchanged.
     elite_count = max(1, int(population_size * 0.10))
     results = sorted_population[:elite_count]
 
-    # Selection strategy 2: tournament selection chooses breeding parents.
+    # Tournament selection supplies parents for crossover.
     while len(results) < population_size:
         parent_a = tournament_select(population)
         parent_b = tournament_select(population)
@@ -563,6 +634,10 @@ def generate_successors(population):
     return results
 
 
+# ---------------------------------------------------------------------------
+# Output and Main Evolution Loop
+# ---------------------------------------------------------------------------
+
 def write_level(filename, individual):
     with open(filename, "w") as level_file:
         for row in individual.to_level():
@@ -570,15 +645,21 @@ def write_level(filename, individual):
 
 
 def ga():
+    # Use 480 individuals for the full experiment. Smaller populations may
+    # be used for local validation.
     pop_limit = 480
     os.makedirs("levels", exist_ok=True)
 
+    # Limit the worker pool to prevent excessive memory consumption caused
+    # by nested process and numerical-library parallelism.
     process_count = min(4, os.cpu_count() or 1, pop_limit)
     batch_size = int(math.ceil(pop_limit / process_count))
 
     with mpool.Pool(processes=process_count) as pool:
         init_time = time.time()
 
+        # Initialize the population with mostly random individuals and a
+        # small proportion of valid flat levels.
         population = [
             Individual.random_individual()
             if random.random() < 0.9
@@ -613,6 +694,8 @@ def ga():
                     print("Average generation time:", (now - start) / generation)
                 print("Net time:", now - start)
 
+                # Store the highest-fitness individual from the current
+                # generation for inspection.
                 write_level("levels/last.txt", best)
 
                 generation += 1
@@ -625,12 +708,15 @@ def ga():
                 population = next_population
 
         except KeyboardInterrupt:
+            # Return the most recently completed population after manual
+            # termination.
             pass
 
     return population
 
 
 if __name__ == "__main__":
+    # The entry-point guard is required for multiprocessing on Windows.
     final_generation = sorted(ga(), key=Individual.fitness, reverse=True)
     print("Best fitness:", final_generation[0].fitness())
 
